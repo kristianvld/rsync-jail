@@ -2,9 +2,9 @@
 
 **A minimal chroot jail based rsync server container over SSH**
 
-[![Docker Image](https://img.shields.io/badge/Docker-ghcr.io%2Fkristianvld%2Frsync--ssh-blue?logo=docker)](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-ssh)
+[![Docker Image](https://img.shields.io/badge/Docker-ghcr.io%2Fkristianvld%2Frsync--ssh-blue?logo=docker)](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-jail)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/kristianvld/rsync-jail/build-image.yml?branch=main&logo=github)](https://github.com/kristianvld/rsync-jail/actions)
-[![Image Size](https://img.shields.io/badge/dynamic/json?url=https://github.com/kristianvld/rsync-jail/releases/latest/download/metadata.json&query=$.image_size_mb&label=Size&color=brightgreen&suffix=MB&logo=docker)](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-ssh)
+[![Image Size](https://img.shields.io/badge/dynamic/json?url=https://github.com/kristianvld/rsync-jail/releases/latest/download/metadata.json&query=$.image_size_mb&label=Size&color=brightgreen&suffix=MB&logo=docker)](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-jail)
 [![Alpine](https://img.shields.io/badge/dynamic/json?url=https://github.com/kristianvld/rsync-jail/releases/latest/download/metadata.json&query=$.alpine&label=Alpine&color=0D597F&logo=alpinelinux)](https://alpinelinux.org/)
 [![OpenSSH](https://img.shields.io/badge/dynamic/json?url=https://github.com/kristianvld/rsync-jail/releases/latest/download/metadata.json&query=$.openssh&label=OpenSSH&color=orange&logo=openssh)](https://www.openssh.com/)
 [![Rsync](https://img.shields.io/badge/dynamic/json?url=https://github.com/kristianvld/rsync-jail/releases/latest/download/metadata.json&query=$.rsync&label=Rsync&color=blue&logo=rsync)](https://rsync.samba.org/)
@@ -70,8 +70,8 @@ Users are defined as environment variables with the pattern `USER_<username>=<ss
 
 ```yaml
 services:
-  rsync-ssh:
-    image: ghcr.io/kristianvld/rsync-ssh:latest
+  rsync-jail:
+    image: ghcr.io/kristianvld/rsync-jail:latest
     ports:
       - "2222:22"
     environment:
@@ -218,7 +218,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Links
 
-- [GitHub Container Registry](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-ssh)
+- [GitHub Container Registry](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-jail)
 - [GitHub Repository](https://github.com/kristianvld/rsync-jail)
 - [Report Issues](https://github.com/kristianvld/rsync-jail/issues)
 

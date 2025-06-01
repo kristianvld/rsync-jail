@@ -1,6 +1,6 @@
 services:
-  rsync-ssh:
-    image: ghcr.io/kristianvld/rsync-ssh:latest
+  rsync-jail:
+    image: ghcr.io/kristianvld/rsync-jail:latest
     ports:
       - "2222:22"
     environment:
