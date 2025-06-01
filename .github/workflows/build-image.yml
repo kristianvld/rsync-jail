@@ -275,9 +275,9 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### 📦 Package Versions" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "Alpine version: ${{ steps.versions.outputs.alpine-version }}"
-            echo "OpenSSH version: ${{ steps.versions.outputs.openssh-version }}"
-            echo "Rsync version: ${{ steps.versions.outputs.rsync-version }}"
+            echo "Alpine version: ${{ steps.versions.outputs.alpine-version }}" >> $GITHUB_STEP_SUMMARY
+            echo "OpenSSH version: ${{ steps.versions.outputs.openssh-version }}" >> $GITHUB_STEP_SUMMARY
+            echo "Rsync version: ${{ steps.versions.outputs.rsync-version }}" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
