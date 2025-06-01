@@ -130,9 +130,9 @@ jobs:
           docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
           # Get package versions
-          ALPINE_VERSION=$(docker run --rm --entrypoint /bin/sh ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest cat /etc/alpine-release | tr -d '\n')
-          OPENSSH_VERSION=$(docker run --rm --entrypoint /bin/sh ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ssh -V 2>&1 | head -1 | sed 's/OpenSSH_//' | cut -d',' -f1 | tr -d '\n')
-          RSYNC_VERSION=$(docker run --rm --entrypoint /bin/sh ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest rsync --version | head -1 | sed 's/rsync  version //' | cut -d' ' -f1 | tr -d '\n')
+          ALPINE_VERSION=$(docker run --rm --entrypoint /bin/sh ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest /bin/cat /etc/alpine-release | tr -d '\n')
+          OPENSSH_VERSION=$(docker run --rm --entrypoint /bin/sh ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest /usr/bin/ssh -V 2>&1 | head -1 | sed 's/OpenSSH_//' | cut -d',' -f1 | tr -d '\n')
+          RSYNC_VERSION=$(docker run --rm --entrypoint /bin/sh ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest /usr/bin/rsync --version | head -1 | sed 's/rsync  version //' | cut -d' ' -f1 | tr -d '\n')
 
           # Get container image size
           IMAGE_SIZE_BYTES=$(docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest --format='{{.Size}}')
