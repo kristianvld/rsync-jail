@@ -21,8 +21,8 @@ fi
 echo "Creating users..."
 count=0
 for username in $(jq -r 'keys[]' /users.json); do
-    keys=$(jq -r ".$username.keys" /users.json)
-    uid=$(jq -r ".$username.uid" /users.json)
+    keys=$(jq -r ".[\"$username\"].keys[]" /users.json)
+    uid=$(jq -r ".[\"$username\"].uid" /users.json)
 
     # -D: Don't assign password, -H: Don't create home directory
     # -h: Set home directory path (inside chroot), -s: set shell (inside chroot)

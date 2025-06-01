@@ -115,8 +115,7 @@ services:
       - ./client-data:/home/client/jail/data:ro  # example persistent read-only storage for the client user
       - ./pre-startup.sh:/pre-startup.sh:ro      # mount a pre-startup script for extra customization (optional)
     restart: unless-stopped
-    networks:
-      - none    # Disable outgoing network access to prevent network pivoting using the rsync command on the server
+    network_mode: none  # Disable outgoing network access to prevent network pivoting using the rsync command on the server
 ```
 
 ### 2. Configure `~/.ssh/config` (optional)
