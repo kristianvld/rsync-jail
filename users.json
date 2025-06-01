@@ -1,0 +1,27 @@
+{
+    "client1": {
+        "uid": 1000,
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA...",
+            "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIB..."
+        ]
+    },
+    "client2": {
+        "uid": 1001,
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC..."
+        ]
+    },
+    "client3": {
+        "uid": 1001,
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE...",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF..."
+        ]
+    },
+    "client4": {
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG..."
+        ]
+    }
+}

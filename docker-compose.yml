@@ -5,12 +5,14 @@ services:
       - "2222:22"
     environment:
       - DEBUG=1
-      - USER_client1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...
-      - USER_client2=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...\nssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAI...
+      - SFTP=1
     volumes:
-      - ./client1-data:/home/client1/jail/data
-      - ./client2-data:/home/client2/jail/data
-      - ./ssh-keys:/etc/ssh/ssh_host_keys/
+      - ./ssh-keys:/etc/ssh/ssh_host_keys/         # Volume for persistent SSH host keys
+      - ./users.json:/users.json:ro                # User definitions file
+      - ./client1-data:/home/client1/jail/data:ro  # Read only data directory for client1
+      - ./client2-data:/home/client2/jail/data     # Read-write data directory for client2
+      - ./client3-data:/home/client3/jail/data     # Read-write data directory for client3
+      - ./client4-data:/home/client4/jail/data     # Read-write data directory for client4
     restart: unless-stopped
     networks:
       - none

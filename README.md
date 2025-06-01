@@ -26,21 +26,19 @@
 - [📝 License](#-license)
 - [🔗 Links](#-links)
 
-
 ## 🎯 What is Rsync Jail?
 
-Rsync Jail is a **minimal** Docker container to provide an `rsync` server over SSH. It allows for easy user configuration through username-sshkey pairs. Each user is put into their own chroot jail, with only access to the bare minimum `sh` and `rsync` binary. Designed for easy mounting of persistent data volumes and strong user segregation, even if the data volumes do not support file permissions for access control management (such as external pure data storage solutions). SFTP can optionally be enabled.
+Rsync Jail is a **minimal** Docker container to provide an `rsync` server over SSH. It allows for easy user configuration where each user is put into their own chroot jail, with only access to the bare minimum `sh` and `rsync` binary. Designed for easy mounting of persistent data volumes and strong user segregation, even if the data volumes do not support file permissions for access control management (such as certain external pure data storage solutions). SFTP can optionally be enabled.
 
 This container allow arbitrary `rsync` commands to be executed by the user, meaning they are able to both read and write data. For environments where even stronger limitations are required, consider using a normal OpenSSH server with `ForceCommand` to force a specific server side execution of `rsync` to be executed.
 
 ## ✨ Key Features
 
 - **Chroot isolation** - Users are chrooted into `/home/<username>/jail/`. Only `sh` and `rsync` are available and `/home/<username>/jail/data/` is their home directory for persistent storage.
-- **Simple User Definitions** - Define users as simple pairs of username and SSH keys
+- **Simple User Definitions** - Define users as simple pairs of username and SSH public key(s)
 - **SFTP** - Optionally enable SFTP
 - **Minimal** - Alpine based, only 19MB in size
 - **Disabled forwarding** - No TCP, agent, or X11 forwarding allowed
-- **No TTY allocation** - Prevents interactive shell access
 - **Daily Updates** - Daily builds are automatically created to catch security updates and package updates
 - **Arm and AMD64** - Builds for both `linux/amd64` and `linux/arm64` architectures available
 
@@ -48,9 +46,42 @@ This container allow arbitrary `rsync` commands to be executed by the user, mean
 
 ### 1. Using Docker Compose (Recommended)
 
-Users are defined as environment variables with the pattern `USER_<username>=<ssh_public_key>`. Multiple keys per user are supported by using a newline separated string.
+Users are defined in the `/users.json` file in the following format:
+```json
+{
+    "client1": {
+        "uid": 1000,
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA...",
+            "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIB..."
+        ]
+    },
+    "client2$": {
+        "uid": 1001,
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC..."
+        ]
+    },
+    "client.3": {
+        "uid": 1001,
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE...",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF..."
+        ]
+    },
+    "client-4": {
+        "keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG..."
+        ]
+    }
+}
+```
 
-> **ℹ️ Understanding Data Paths**
+Here 4 users are defined using the usernames `client1`, `client2$`, `client.3` and `client-4`. Users may have an optional `uid` key to define the numerical UID of the users. Multiple users may use the same UID, and due to the use of chroot, users with the same uid will still not have access to each other's data directories. Users may even be given UID of `0` (`root`) if desired, which may be required for rsync to set correct permissions during transfer, but should not pose any security issue due to the chroot isolation. If no `uid` key is provided, the user id will be assigned a new unused UID.
+
+Users may have multiple SSH public keys, which will be added to the user's authorized keys file. If no `keys` key is provided, the user will not be able to login.
+
+> **‼️ Understanding Data Paths**
 >
 > Each user operates within a chroot jail where their view of the filesystem is restricted:
 >
@@ -75,18 +106,17 @@ services:
     ports:
       - "2222:22"
     environment:
-      - USER_backup=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@workstation
-      - USER_client=ssh-rsa AAAAB3NzaC1yc2EAAAA... client@laptop\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... client@desktop # multiple keys per user using \n newline separator
       - SFTP=1   # enable SFTP (optional)
       - DEBUG=1  # enable debug mode (optional)
     volumes:
-      - ./backup-data:/home/backup/jail/data      # example persistent read-write storage for the backup user
-      - ./client-data:/home/client/jail/data:ro   # example persistent read-only storage for the client user
-      - ./ssh-keys:/etc/ssh/ssh_host_keys/        # volume for persistent SSH host keys between container restarts
-      - ./pre-startup.sh:/pre-startup.sh:ro       # mount a pre-startup script for extra customization (optional)
+      - ./ssh-keys:/etc/ssh/ssh_host_keys/       # volume for persistent SSH host keys between container restarts
+      - ./users.json:/users.json:ro              # user definitions file
+      - ./backup-data:/home/backup/jail/data     # example persistent read-write storage for the backup user
+      - ./client-data:/home/client/jail/data:ro  # example persistent read-only storage for the client user
+      - ./pre-startup.sh:/pre-startup.sh:ro      # mount a pre-startup script for extra customization (optional)
     restart: unless-stopped
     networks:
-      - none     # Disable outgoing network access to prevent network pivoting using the rsync command on the server
+      - none    # Disable outgoing network access to prevent network pivoting using the rsync command on the server
 ```
 
 ### 2. Configure `~/.ssh/config` (optional)
@@ -179,8 +209,6 @@ During startup, the script `/pre-startup.sh` is executed if it exists. The scrip
 
 | Variable          | Description                                                                                                       | Required | Example                                               |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------------------------------- |
-| `USER_<username>` | SSH public key(s) for the user. Multiple keys can be separated by `\n`.                                           | Yes      | `USER_alice=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...` |
-| `UID_<username>`  | Custom user uid for the user. If not set, the user id will be assigned in order of appearance starting at `1000`. | No       | `UID_alice=1003`                                      |
 | `DEBUG`           | Enable debug logging and verbose output.                                                                          | No       | `DEBUG=1`                                             |
 | `SFTP`            | Enable SFTP subsystem in addition to `rsync`.                                                                     | No       | `SFTP=1`                                              |
 
@@ -188,6 +216,7 @@ During startup, the script `/pre-startup.sh` is executed if it exists. The scrip
 
 | Volume Path                  | Description                                                                         | Required | Example                              |
 | ---------------------------- | ----------------------------------------------------------------------------------- | -------- | ------------------------------------ |
+| `/users.json`                | User definitions file.                                                                 | Yes      | `./users.json:/users.json:ro`        |
 | `/home/<username>/jail/data` | User's data directory. Maps to `/data/` inside the chroot jail.                     | Yes      | `./user1-data:/home/user1/jail/data` |
 | `/etc/ssh/ssh_host_keys/`    | Persistent SSH host keys directory. Prevents host key changes on container restart. | No       | `./ssh-keys:/etc/ssh/ssh_host_keys/` |
 | `/pre-startup.sh`            | Optional startup script executed before SSH server starts. Must be executable.      | No       | `./my-script.sh:/pre-startup.sh`     |
@@ -198,7 +227,6 @@ During startup, the script `/pre-startup.sh` is executed if it exists. The scrip
 - **Ownership**: Container automatically sets `username:username` ownership on `/home/<username>/jail/data/` at startup
   - **No recursive chown**: Only the mount point ownership is changed, not existing files. Any file permissions within the data directory will have to be set or updated manually. This can be used to limit access to data in the data directory.
 - **Startup Script**: If `/pre-startup.sh` exists, it's executed as the final step before starting SSH server. Non-zero exit codes will prevent container startup.
-
 
 ## 🏗️ Building from Source
 
@@ -221,4 +249,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [GitHub Container Registry](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-jail)
 - [GitHub Repository](https://github.com/kristianvld/rsync-jail)
 - [Report Issues](https://github.com/kristianvld/rsync-jail/issues)
-

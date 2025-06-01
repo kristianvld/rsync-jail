@@ -2,7 +2,7 @@ FROM alpine:latest
 
 # Install OpenSSH and rsync. Then create a /jail template directory that
 # all users will have, with only access to /bin/sh and /usr/bin/rsync (with libraries).
-RUN apk add --no-cache openssh rsync && \
+RUN apk add --no-cache jq openssh rsync && \
     apk del --purge apk-tools && \
     rm -rf /var/cache/apk/* /tmp/* /var/tmp/* /usr/share/man/* /usr/share/doc/* && \
     mkdir -p /jail/bin/ /jail/usr/bin/ /jail/usr/lib/ /jail/lib/ && \

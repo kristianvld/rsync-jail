@@ -13,17 +13,21 @@ if [ -n "$SFTP" ]; then
     echo "Subsystem       sftp    internal-sftp" >> /etc/ssh/sshd_config
 fi
 
+if [ ! -f /users.json ]; then
+    echo "Missing /users.json file. No users defined. Exiting..."
+    exit 1
+fi
+
 echo "Creating users..."
 count=0
-for var in $(env | grep '^USER_' | cut -d= -f1); do
-    username=$(echo "$var" | sed 's/^USER_//')
-    key=$(eval echo "\$USER_$username")
-    uid=$(eval echo "\$UID_$username")
+for username in $(jq -r 'keys[]' /users.json); do
+    keys=$(jq -r ".$username.keys" /users.json)
+    uid=$(jq -r ".$username.uid" /users.json)
 
     # -D: Don't assign password, -H: Don't create home directory
     # -h: Set home directory path (inside chroot), -s: set shell (inside chroot)
     # -u: Set user id
-    if [ -n "$uid" ]; then
+    if [ "$uid" != "null" ]; then
         adduser -D -H -h "/data" -s "/bin/sh" -u "$uid" "$username"
     else
         adduser -D -H -h "/data" -s "/bin/sh" "$username"
@@ -34,7 +38,7 @@ for var in $(env | grep '^USER_' | cut -d= -f1); do
     passwd -d "$username" 2>&1 > /dev/null
 
     mkdir -p "/home/$username/.ssh/"
-    echo -e "$key" > "/home/$username/.ssh/authorized_keys"
+    echo -e "$keys" > "/home/$username/.ssh/authorized_keys"
     cp -a "/jail/" "/home/$username/"
     mkdir -p "/home/$username/jail/data/"
     chown "$username:$username" "/home/$username/jail/data/" || true
