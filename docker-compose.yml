@@ -1,0 +1,16 @@
+services:
+  rsync-ssh:
+    image: ghcr.io/kristianvld/rsync-ssh:latest
+    ports:
+      - "2222:22"
+    environment:
+      - DEBUG=1
+      - USER_client1=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...
+      - USER_client2=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...\nssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAI...
+    volumes:
+      - ./client1-data:/home/client1/jail/data
+      - ./client2-data:/home/client2/jail/data
+      - ./ssh-keys:/etc/ssh/ssh_host_keys/
+    restart: unless-stopped
+    networks:
+      - none

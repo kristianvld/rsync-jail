@@ -1,0 +1,23 @@
+Include /etc/ssh/sshd_config.d/*.conf
+
+LogLevel VERBOSE
+
+HostKey /etc/ssh/ssh_host_keys/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_keys/ssh_host_rsa_key
+
+LoginGraceTime 2m
+PermitRootLogin no
+PubkeyAuthentication yes
+ChallengeResponseAuthentication no
+AuthorizedKeysFile /home/%u/.ssh/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AllowAgentForwarding no
+AllowTcpForwarding no
+GatewayPorts no
+X11Forwarding no
+PermitTTY no
+TCPKeepAlive yes
+PermitUserEnvironment no
+PermitTunnel no
+ChrootDirectory /home/%u/jail/

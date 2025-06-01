@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Update GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "kristianvld"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Update Docker base images in Dockerfile
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+    open-pull-requests-limit: 3
+    reviewers:
+      - "kristianvld"
+    commit-message:
+      prefix: "chore"
+      include: "scope"

@@ -1,0 +1,247 @@
+name: Build and Push Container Image
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    # Build daily to catch any updates (base image, packages, security fixes)
+    - cron: "0 6 * * *"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{date 'YYYY-MM-DD'}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value={{date 'YYYY-MM-DD'}},enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=Rsync Jail
+            org.opencontainers.image.description=A minimal, hardened SSH container for secure rsync-only access
+
+      - name: Check if image content changed
+        if: github.event_name != 'pull_request'
+        id: image-check
+        run: |
+          # Build a single-platform image locally to get its digest
+          docker buildx build \
+            --platform linux/amd64 \
+            --tag temp-check:latest \
+            --load \
+            .
+
+          # Get the digest of the newly built image
+          NEW_DIGEST=$(docker inspect temp-check:latest --format='{{.Id}}')
+          echo "New image digest: $NEW_DIGEST"
+
+          # Try to get the digest of the current latest image from registry
+          CURRENT_DIGEST=""
+          if docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>/dev/null; then
+            CURRENT_DIGEST=$(docker inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest --format='{{.Id}}')
+            echo "Current image digest: $CURRENT_DIGEST"
+          else
+            echo "No existing image found in registry"
+          fi
+
+          # Compare digests
+          if [ "$NEW_DIGEST" = "$CURRENT_DIGEST" ] && [ -n "$CURRENT_DIGEST" ]; then
+            echo "Image content is identical - skipping push"
+            echo "should-push=false" >> $GITHUB_OUTPUT
+            echo "image-changed=false" >> $GITHUB_OUTPUT
+
+            # Get current Alpine and package versions for reporting
+            echo "Getting current package versions..."
+            docker run --rm temp-check:latest sh -c "
+              echo 'Alpine version:' && cat /etc/alpine-release
+              echo 'OpenSSH version:' && ssh -V 2>&1 | head -1
+              echo 'Rsync version:' && rsync --version | head -1
+            " > package-info.txt || true
+
+          else
+            echo "Image content has changed - will push"
+            echo "should-push=true" >> $GITHUB_OUTPUT
+            echo "image-changed=true" >> $GITHUB_OUTPUT
+
+            # Get new package versions for reporting
+            echo "Getting updated package versions..."
+            docker run --rm temp-check:latest sh -c "
+              echo 'Alpine version:' && cat /etc/alpine-release
+              echo 'OpenSSH version:' && ssh -V 2>&1 | head -1
+              echo 'Rsync version:' && rsync --version | head -1
+            " > package-info.txt || true
+          fi
+
+          # Clean up temp image
+          docker rmi temp-check:latest || true
+
+      - name: Push Docker image
+        if: github.event_name == 'pull_request' || steps.image-check.outputs.should-push == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create release with package metadata
+        if: github.event_name != 'pull_request' && steps.image-check.outputs.should-push == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          # Extract versions from the newly built image
+          echo "Extracting package versions from new image..."
+
+          # Pull the latest image we just pushed
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+          # Get package versions
+          ALPINE_VERSION=$(docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest cat /etc/alpine-release | tr -d '\n')
+          OPENSSH_VERSION=$(docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ssh -V 2>&1 | head -1 | sed 's/OpenSSH_//' | cut -d',' -f1 | tr -d '\n')
+          RSYNC_VERSION=$(docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest rsync --version | head -1 | sed 's/rsync  version //' | cut -d' ' -f1 | tr -d '\n')
+
+          # Get container image size
+          IMAGE_SIZE_BYTES=$(docker image inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest --format='{{.Size}}')
+          IMAGE_SIZE_MB=$(echo "scale=1; $IMAGE_SIZE_BYTES / 1024 / 1024" | bc)
+
+          echo "Alpine: $ALPINE_VERSION"
+          echo "OpenSSH: $OPENSSH_VERSION"
+          echo "Rsync: $RSYNC_VERSION"
+          echo "Image Size: ${IMAGE_SIZE_MB}MB"
+
+          # Generate release tag with current date
+          RELEASE_TAG="$(date +%Y-%m-%d)"
+          RELEASE_NAME="Daily Build $(date +%Y-%m-%d)"
+
+          # Create structured release body
+          RELEASE_BODY="## 📦 Package Versions
+
+          - **Alpine Linux**: $ALPINE_VERSION
+          - **OpenSSH**: $OPENSSH_VERSION
+          - **Rsync**: $RSYNC_VERSION
+
+          ## 🐳 Container Image
+
+          - **Size**: ${IMAGE_SIZE_MB}MB
+          - **Platforms**: linux/amd64, linux/arm64
+
+          \`\`\`bash
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$RELEASE_TAG
+          \`\`\`
+
+          ## 📋 Build Information
+
+          - **Build Date**: $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)
+          - **Git SHA**: ${{ github.sha }}
+          - **Trigger**: ${{ github.event_name == 'schedule' && 'Scheduled daily build' || 'Code changes' }}
+
+          This release was automatically created when package updates were detected."
+
+          # Create comprehensive metadata JSON file
+          cat > metadata.json << EOF
+          {
+            "alpine": "$ALPINE_VERSION",
+            "openssh": "$OPENSSH_VERSION",
+            "rsync": "$RSYNC_VERSION",
+            "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "git_sha": "${{ github.sha }}",
+            "trigger": "${{ github.event_name == 'schedule' && 'scheduled' || 'manual' }}",
+            "platforms": ["linux/amd64", "linux/arm64"],
+            "registry": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}",
+            "image_size_bytes": $IMAGE_SIZE_BYTES,
+            "image_size_mb": "$IMAGE_SIZE_MB"
+          }
+          EOF
+
+          # Delete existing release with same tag if it exists
+          gh release delete "$RELEASE_TAG" --yes 2>/dev/null || true
+
+          # Create new release with the metadata file
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_NAME" \
+            --notes "$RELEASE_BODY" \
+            --latest \
+            metadata.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate build summary
+        run: |
+          # Read package info if available
+          PACKAGE_INFO=""
+          if [ -f package-info.txt ]; then
+            PACKAGE_INFO=$(cat package-info.txt)
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "## 🐳 Container Image Built (PR)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Image built successfully but not pushed (PR mode)" >> $GITHUB_STEP_SUMMARY
+
+          elif [ "${{ steps.image-check.outputs.image-changed }}" = "false" ]; then
+            echo "## ⚡ No Changes Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Image content is identical to existing version - no push needed" >> $GITHUB_STEP_SUMMARY
+            echo "This saves registry storage and avoids unnecessary updates." >> $GITHUB_STEP_SUMMARY
+            if [ -n "$PACKAGE_INFO" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### 📦 Current Package Versions" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "$PACKAGE_INFO" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+
+          else
+            echo "## 🐳 Container Image Built and Pushed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Reason**: ${{ github.event_name == 'schedule' && 'Scheduled build detected changes' || 'Code changes or manual trigger' }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            if [ -n "$PACKAGE_INFO" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### 📦 Package Versions in New Image" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "$PACKAGE_INFO" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
