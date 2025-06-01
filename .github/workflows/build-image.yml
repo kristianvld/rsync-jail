@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
   schedule:
     # Build daily to catch any updates (base image, packages, security fixes)
@@ -110,7 +107,7 @@ jobs:
 
       - name: Push Docker image
         if: github.event_name == 'pull_request' || steps.image-check.outputs.should-push == 'true'
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64

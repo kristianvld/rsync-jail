@@ -1,6 +1,6 @@
 # 🔒 Rsync Jail
 
-**A minimal, hardened SSH container for secure rsync-only access**
+**A minimal chroot jail based rsync server container over SSH**
 
 [![Docker Image](https://img.shields.io/badge/Docker-ghcr.io%2Fkristianvld%2Frsync--ssh-blue?logo=docker)](https://github.com/kristianvld/rsync-jail/pkgs/container/rsync-ssh)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/kristianvld/rsync-jail/build-image.yml?branch=main&logo=github)](https://github.com/kristianvld/rsync-jail/actions)
@@ -170,7 +170,8 @@ During startup, the script `/pre-startup.sh` is executed if it exists. The scrip
 │       ├── libz.so.1               # Zlib compression (rsync)
 │       └── libzstd.so.1            # Zstandard compression
 ├── lib/
-│   └── ld-musl-aarch64.so.1        # Dynamic linker (rsync and sh)
+│   └── ld-musl-aarch64.so.1        # Dynamic linker (rsync and sh) [arm64 only]
+│   └── ld-musl-x86_64.so.1         # Dynamic linker (rsync and sh) [amd64 only]
 └── data/                           # User's home directory and persistent data storage
 ```
 
