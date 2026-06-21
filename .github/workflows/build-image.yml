@@ -554,19 +554,19 @@ jobs:
             package_scope="users/${OWNER}"
           fi
 
-          version_ids="$(
-            gh api "/${package_scope}/packages/container/${PACKAGE_NAME}/versions" \
-              --paginate \
-              --jq ".[] | select(.metadata.container.tags[]? == \"${CANDIDATE_TAG}\") | .id"
-          )"
-          version_id="$(printf '%s\n' "${version_ids}" | sed -n '1p')"
-
-          if [ -z "${version_id}" ]; then
-            echo "No scan candidate package version found for tag ${CANDIDATE_TAG}."
+          response_file="$(mktemp)"
+          if gh api \
+            --method DELETE \
+            -H "Accept: application/vnd.github+json" \
+            "/${package_scope}/packages/container/${PACKAGE_NAME}" 2>"${response_file}"; then
+            echo "Deleted scan candidate staging package ${PACKAGE_NAME}."
             exit 0
           fi
 
-          gh api \
-            --method DELETE \
-            -H "Accept: application/vnd.github+json" \
-            "/${package_scope}/packages/container/${PACKAGE_NAME}/versions/${version_id}"
+          if grep -q '"status":"404"' "${response_file}"; then
+            echo "No scan candidate staging package found for ${CANDIDATE_TAG}."
+            exit 0
+          fi
+
+          cat "${response_file}" >&2
+          exit 1
