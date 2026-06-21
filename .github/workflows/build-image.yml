@@ -9,30 +9,45 @@ on:
       - main
   workflow_dispatch:
   schedule:
-    # Build daily to catch any updates (base image, packages, security fixes)
+    # Build daily to catch base image, package, and security updates.
     - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  STAGING_IMAGE_NAME: ${{ github.repository }}-staging
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build and publish image
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
-      packages: write
+      contents: write # create/update the daily GitHub Release metadata
+      packages: write # push the container image to GHCR
+      security-events: write # upload pre-promotion Trivy SARIF to code scanning
+      issues: write # open/update the vulnerability tracking issue
+      id-token: write # sign public image attestations with GitHub OIDC
+      attestations: write # publish provenance and SBOM attestations for the promoted image
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -40,7 +55,7 @@ jobs:
 
       - name: Generate metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -53,22 +68,14 @@ jobs:
             org.opencontainers.image.title=Rsync Jail
             org.opencontainers.image.description=A minimal, hardened SSH container for secure rsync-only access
 
-      - name: Check for file changes (skip image content check for efficiency)
-        if: github.event_name != 'pull_request'
-        id: changes
-        run: |
-          # For non-PR events, we'll build first then decide whether to push based on content
-          echo "should-build=true" >> $GITHUB_OUTPUT
-          echo "change-reason=${{ github.event_name == 'schedule' && 'scheduled' || 'code-changes' }}" >> $GITHUB_OUTPUT
-
-      - name: Build Docker image (always build to get digest)
-        if: github.event_name == 'pull_request' || steps.changes.outputs.should-build == 'true'
+      - name: Build Docker image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: false # Build but don't push yet
+          pull: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -78,207 +85,488 @@ jobs:
       - name: Check if image content changed
         if: github.event_name != 'pull_request'
         id: content-check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEW_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          # Get the digest of the newly built image
-          NEW_DIGEST="${{ steps.build.outputs.digest }}"
-          echo "New image digest: $NEW_DIGEST"
+          set -euo pipefail
 
-          # Try to get the digest of the current latest image from registry
-          CURRENT_DIGEST=""
-          if docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest 2>/dev/null; then
-            CURRENT_DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest --format '{{.Manifest.Digest}}')
-            echo "Current image digest: $CURRENT_DIGEST"
+          image="${REGISTRY}/${IMAGE_NAME}"
+          new_digest="${NEW_DIGEST}"
+          current_digest=""
+
+          echo "New image digest: ${new_digest}"
+
+          if docker buildx imagetools inspect "${image}:latest" >/dev/null 2>&1; then
+            current_digest="$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.Digest}}')"
+            echo "Current image digest: ${current_digest}"
           else
             echo "No existing image found in registry"
           fi
 
-          # Compare digests
-          if [ "$NEW_DIGEST" = "$CURRENT_DIGEST" ] && [ -n "$CURRENT_DIGEST" ]; then
-            if [ "${{ github.event_name }}" = "schedule" ]; then
-              # For scheduled builds, check image age even if content is same
-              BUILD_DATE=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest --format '{{.Manifest.CreatedAt}}' 2>/dev/null || echo "")
-              if [ -n "$BUILD_DATE" ]; then
-                LAST_EPOCH=$(date -d "$BUILD_DATE" +%s 2>/dev/null || echo "0")
-                CURRENT_EPOCH=$(date +%s)
-                AGE_HOURS=$(( (CURRENT_EPOCH - LAST_EPOCH) / 3600 ))
+          write_push_decision() {
+            {
+              echo "should-push=$1"
+              echo "image-changed=$2"
+              echo "push-reason=$3"
+            } >> "$GITHUB_OUTPUT"
+          }
 
-                if [ $AGE_HOURS -gt 24 ]; then
-                  echo "Image content identical but $AGE_HOURS hours old - rebuilding anyway for potential package updates"
-                  echo "should-push=true" >> $GITHUB_OUTPUT
-                  echo "image-changed=true" >> $GITHUB_OUTPUT
-                  echo "push-reason=scheduled-rebuild" >> $GITHUB_OUTPUT
+          if [ "${new_digest}" = "${current_digest}" ] && [ -n "${current_digest}" ]; then
+            if [ "${EVENT_NAME}" = "schedule" ]; then
+              build_date="$(docker buildx imagetools inspect "${image}:latest" --format '{{.Manifest.CreatedAt}}' 2>/dev/null || true)"
+              if [ -n "${build_date}" ]; then
+                last_epoch="$(date -d "${build_date}" +%s 2>/dev/null || echo "0")"
+                current_epoch="$(date +%s)"
+                age_hours=$(( (current_epoch - last_epoch) / 3600 ))
+
+                if [ "${age_hours}" -gt 24 ]; then
+                  echo "Image content identical but ${age_hours} hours old; pushing scheduled rebuild."
+                  write_push_decision true true scheduled-rebuild
                 else
-                  echo "Image content identical and only $AGE_HOURS hours old - skipping push"
-                  echo "should-push=false" >> $GITHUB_OUTPUT
-                  echo "image-changed=false" >> $GITHUB_OUTPUT
-                  echo "push-reason=no-changes-recent" >> $GITHUB_OUTPUT
+                  echo "Image content identical and only ${age_hours} hours old; skipping push."
+                  write_push_decision false false no-changes-recent
                 fi
               else
-                echo "Cannot determine image age - rebuilding to be safe"
-                echo "should-push=true" >> $GITHUB_OUTPUT
-                echo "image-changed=true" >> $GITHUB_OUTPUT
-                echo "push-reason=scheduled-age-unknown" >> $GITHUB_OUTPUT
+                echo "Cannot determine image age; pushing scheduled rebuild."
+                write_push_decision true true scheduled-age-unknown
               fi
             else
-              echo "Image content is identical - skipping push"
-              echo "should-push=false" >> $GITHUB_OUTPUT
-              echo "image-changed=false" >> $GITHUB_OUTPUT
-              echo "push-reason=no-changes" >> $GITHUB_OUTPUT
+              echo "Image content is identical; skipping push."
+              write_push_decision false false no-changes
             fi
           else
-            echo "Image content has changed - will push"
-            echo "should-push=true" >> $GITHUB_OUTPUT
-            echo "image-changed=true" >> $GITHUB_OUTPUT
-            echo "push-reason=content-changed" >> $GITHUB_OUTPUT
+            echo "Image content has changed; pushing."
+            write_push_decision true true content-changed
           fi
 
-      - name: Push Docker image
-        if: github.event_name == 'pull_request' || steps.content-check.outputs.should-push == 'true'
-        uses: docker/build-push-action@v6
+      - name: Push scan candidate image
+        id: candidate
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          pull: true
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}:scan-${{ github.run_id }}-${{ github.run_attempt }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
 
-      - name: Extract package versions (once)
-        if: github.event_name != 'pull_request' && (steps.content-check.outputs.should-push == 'true' || github.event_name == 'pull_request')
-        id: versions
+      - name: Run Trivy vulnerability scanner
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}@${{ steps.candidate.outputs.digest }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Run Trivy vulnerability scanner (table output)
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}@${{ steps.candidate.outputs.digest }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
+
+      - name: Check for high or critical vulnerabilities
+        id: vulnerability-check
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}@${{ steps.candidate.outputs.digest }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "1"
+
+      - name: Generate security summary
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}@${{ steps.candidate.outputs.digest }}
+          VULNERABILITIES_FOUND: ${{ steps.vulnerability-check.outcome == 'failure' }}
         run: |
-          # Use the local cache from buildx instead of pulling from registry
-          # Build a local image just for version extraction (lightweight, single platform)
-          docker buildx build \
-            --platform linux/amd64 \
-            --tag version-check:latest \
-            --load \
-            --cache-from type=gha \
-            .
+          set -euo pipefail
 
-          # Extract all package versions in one go
-          VERSIONS=$(docker run --rm --entrypoint /bin/sh version-check:latest -c "
-            echo \"ALPINE=\$(cat /etc/alpine-release | tr -d '\n')\"
-            echo \"OPENSSH=\$(ssh -V 2>&1 | head -1 | sed 's/OpenSSH_//' | cut -d',' -f1 | tr -d '\n')\"
-            echo \"RSYNC=\$(rsync --version | head -1 | sed 's/rsync  version //' | cut -d' ' -f1 | tr -d '\n')\"
-          ")
+          {
+            echo "## Security Scan Results"
+            echo
+            echo "**Candidate image:** \`${IMAGE_REF}\`"
+            echo
 
-          # Parse the versions
-          eval "$VERSIONS"
+            if [ "${VULNERABILITIES_FOUND}" = "true" ]; then
+              echo "**High or critical vulnerabilities detected.** Public tag promotion was stopped."
+            else
+              echo "**No high or critical vulnerabilities found.** The image can be promoted."
+            fi
 
-          echo "alpine-version=$ALPINE" >> $GITHUB_OUTPUT
-          echo "openssh-version=$OPENSSH" >> $GITHUB_OUTPUT
-          echo "rsync-version=$RSYNC" >> $GITHUB_OUTPUT
+            echo
+            echo "Detailed vulnerability report is available in the Security tab."
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          # Get image size
-          IMAGE_SIZE_BYTES=$(docker image inspect version-check:latest --format='{{.Size}}')
-          IMAGE_SIZE_MB=$(echo "scale=1; $IMAGE_SIZE_BYTES / 1024 / 1024" | bc)
-          echo "image-size-mb=$IMAGE_SIZE_MB" >> $GITHUB_OUTPUT
+      - name: Create or update issue for high or critical vulnerabilities
+        if: steps.vulnerability-check.outcome == 'failure'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}@${{ steps.candidate.outputs.digest }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const image = process.env.IMAGE_REF;
+            const title = 'High or Critical Security Vulnerabilities Detected';
+            const runUrl = `${context.payload.repository.html_url}/actions/runs/${context.runId}`;
+            const labels = [
+              { name: 'security', color: 'd73a4a' },
+              { name: 'vulnerability', color: 'd73a4a' },
+              { name: 'high', color: 'fbca04' },
+              { name: 'critical', color: 'b60205' }
+            ];
 
-          echo "Alpine: $ALPINE"
-          echo "OpenSSH: $OPENSSH"
-          echo "Rsync: $RSYNC"
-          echo "Image Size: ${IMAGE_SIZE_MB}MB"
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...label });
+              } catch (error) {
+                if (error.status !== 422) throw error;
+              }
+            }
 
-          # Clean up
-          docker rmi version-check:latest || true
+            const body = `
+            ## High or Critical Security Vulnerabilities Detected
+
+            The automated security scan detected high or critical vulnerabilities in a candidate container image. Public tag promotion was stopped.
+
+            **Image:** \`${image}\`
+            **Scan Date:** ${new Date().toISOString().split('T')[0]}
+            **Workflow Run:** ${runUrl}
+
+            ### Action Required
+
+            Review the vulnerabilities in the [Security tab](${context.payload.repository.html_url}/security/code-scanning) and update the base image or packages as needed.
+
+            This issue was automatically created by the security scan workflow.
+            `;
+
+            const issues = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            const existingIssue = issues.data.find(issue => issue.title === title);
+            if (existingIssue) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existingIssue.number,
+                body
+              });
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existingIssue.number,
+                body: `High or critical vulnerabilities are still present in \`${image}\`.\n\nWorkflow run: ${runUrl}`
+              });
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+              labels: labels.map(label => label.name)
+            });
+
+      - name: Fail before public tag promotion on high or critical vulnerabilities
+        if: steps.vulnerability-check.outcome == 'failure'
+        run: exit 1
+
+      - name: Promote scanned image
+        id: promoted
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        env:
+          CANDIDATE_REF: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}@${{ steps.candidate.outputs.digest }}
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_args=()
+          promoted_tags=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              tag_args+=(--tag "$tag")
+              promoted_tags+=("$tag")
+            fi
+          done <<< "$TAGS"
+
+          if [ "${#tag_args[@]}" -eq 0 ]; then
+            echo "No tags generated for promotion." >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "$CANDIDATE_REF"
+
+          for tag in "${promoted_tags[@]}"; do
+            promoted_digest="$(docker buildx imagetools inspect "$tag" --format '{{.Manifest.Digest}}')"
+            if [ "${promoted_digest}" != "${CANDIDATE_DIGEST}" ]; then
+              echo "Promoted tag ${tag} resolved to ${promoted_digest}, expected ${CANDIDATE_DIGEST}." >&2
+              exit 1
+            fi
+            echo "Verified ${tag} resolves to scanned digest ${promoted_digest}."
+          done
+
+          echo "digest=${CANDIDATE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # GHCR requires the subject digest to exist in the public package before
+      # registry-backed attestation bundles can be pushed and verified.
+      - name: Generate public image provenance attestation
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.promoted.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Generate SBOM for public image
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.promoted.outputs.digest }}
+          format: spdx-json
+          output: image-sbom.spdx.json
+
+      - name: Generate public image SBOM attestation
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.promoted.outputs.digest }}
+          sbom-path: image-sbom.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Verify public image attestations
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROMOTED_DIGEST: ${{ steps.promoted.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          image_uri="oci://${REGISTRY}/${IMAGE_NAME}@${PROMOTED_DIGEST}"
+
+          for attempt in 1 2 3; do
+            if gh attestation verify "${image_uri}" -R "${GITHUB_REPOSITORY}" --bundle-from-oci &&
+               gh attestation verify "${image_uri}" -R "${GITHUB_REPOSITORY}" --bundle-from-oci --predicate-type https://spdx.dev/Document/v2.3; then
+              echo "Verified provenance and SBOM attestations for ${image_uri}."
+              exit 0
+            fi
+
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Attestations are not queryable yet; retrying in 10 seconds."
+              sleep 10
+            fi
+          done
+
+          echo "Unable to verify provenance and SBOM attestations for ${image_uri}." >&2
+          exit 1
+
+      - name: Extract package versions
+        if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        id: versions
+        env:
+          CANDIDATE_REF: ${{ env.REGISTRY }}/${{ env.STAGING_IMAGE_NAME }}@${{ steps.candidate.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          docker pull --platform linux/amd64 "${CANDIDATE_REF}"
+
+          versions="$(docker run --rm --platform linux/amd64 --entrypoint /bin/sh "${CANDIDATE_REF}" -c '
+            printf "ALPINE=%s\n" "$(cat /etc/alpine-release | tr -d "\n")"
+            printf "OPENSSH=%s\n" "$(ssh -V 2>&1 | head -1 | sed "s/OpenSSH_//" | cut -d"," -f1 | tr -d "\n")"
+            printf "RSYNC=%s\n" "$(rsync --version | head -1 | sed "s/rsync  version //" | cut -d" " -f1 | tr -d "\n")"
+          ')"
+
+          eval "${versions}"
+
+          image_size_bytes="$(docker image inspect "${CANDIDATE_REF}" --format='{{.Size}}')"
+          image_size_mb="$(echo "scale=1; ${image_size_bytes} / 1024 / 1024" | bc)"
+
+          {
+            echo "alpine-version=${ALPINE}"
+            echo "openssh-version=${OPENSSH}"
+            echo "rsync-version=${RSYNC}"
+            echo "image-size-mb=${image_size_mb}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Alpine: ${ALPINE}"
+          echo "OpenSSH: ${OPENSSH}"
+          echo "Rsync: ${RSYNC}"
+          echo "Image Size: ${image_size_mb}MB"
 
       - name: Create release with package metadata
         if: github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALPINE_VERSION: ${{ steps.versions.outputs.alpine-version }}
+          OPENSSH_VERSION: ${{ steps.versions.outputs.openssh-version }}
+          RSYNC_VERSION: ${{ steps.versions.outputs.rsync-version }}
+          IMAGE_SIZE_MB: ${{ steps.versions.outputs.image-size-mb }}
+          PUSH_REASON: ${{ steps.content-check.outputs.push-reason }}
+          GIT_SHA: ${{ github.sha }}
         run: |
-          ALPINE_VERSION="${{ steps.versions.outputs.alpine-version }}"
-          OPENSSH_VERSION="${{ steps.versions.outputs.openssh-version }}"
-          RSYNC_VERSION="${{ steps.versions.outputs.rsync-version }}"
-          IMAGE_SIZE_MB="${{ steps.versions.outputs.image-size-mb }}"
+          set -euo pipefail
 
-          # Generate release tag with current date
-          RELEASE_TAG="$(date +%Y-%m-%d)"
-          RELEASE_NAME="Daily Build $(date +%Y-%m-%d)"
+          image="${REGISTRY}/${IMAGE_NAME}"
+          release_tag="$(date +%Y-%m-%d)"
+          release_name="Daily Build ${release_tag}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # Create structured release body
-          RELEASE_BODY="## 📦 Package Versions
+          cat > release-notes.md << EOF
+          ## Package Versions
 
-          - **Alpine Linux**: $ALPINE_VERSION
-          - **OpenSSH**: $OPENSSH_VERSION
-          - **Rsync**: $RSYNC_VERSION
+          - **Alpine Linux**: ${ALPINE_VERSION}
+          - **OpenSSH**: ${OPENSSH_VERSION}
+          - **Rsync**: ${RSYNC_VERSION}
 
-          ## 🐳 Container Image
+          ## Container Image
 
           - **Size**: ${IMAGE_SIZE_MB}MB
           - **Platforms**: linux/amd64, linux/arm64
 
           \`\`\`bash
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$RELEASE_TAG
+          docker pull ${image}:latest
+          docker pull ${image}:${release_tag}
           \`\`\`
 
-          ## 📋 Build Information
+          ## Build Information
 
-          - **Build Date**: $(date -u +%Y-%m-%d\ %H:%M:%S\ UTC)
-          - **Git SHA**: ${{ github.sha }}
-          - **Trigger**: ${{ steps.content-check.outputs.push-reason }}
+          - **Build Date**: ${build_date}
+          - **Git SHA**: ${GIT_SHA}
+          - **Trigger**: ${PUSH_REASON}
 
-          This release was automatically created when changes were detected."
-
-          # Create comprehensive metadata JSON file
-          cat > metadata.json << EOF
-          {
-            "alpine": "$ALPINE_VERSION",
-            "openssh": "$OPENSSH_VERSION",
-            "rsync": "$RSYNC_VERSION",
-            "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "git_sha": "${{ github.sha }}",
-            "trigger": "${{ steps.content-check.outputs.push-reason }}",
-            "platforms": ["linux/amd64", "linux/arm64"],
-            "registry": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}",
-            "image_size_mb": "$IMAGE_SIZE_MB"
-          }
+          This release was automatically created when changes were detected.
           EOF
 
-          # Delete existing release with same tag if it exists
-          gh release delete "$RELEASE_TAG" --yes 2>/dev/null || true
+          jq -n \
+            --arg alpine "${ALPINE_VERSION}" \
+            --arg openssh "${OPENSSH_VERSION}" \
+            --arg rsync "${RSYNC_VERSION}" \
+            --arg build_date "${build_date}" \
+            --arg git_sha "${GIT_SHA}" \
+            --arg trigger "${PUSH_REASON}" \
+            --arg registry "${image}" \
+            --arg image_size_mb "${IMAGE_SIZE_MB}" \
+            '{
+              alpine: $alpine,
+              openssh: $openssh,
+              rsync: $rsync,
+              build_date: $build_date,
+              git_sha: $git_sha,
+              trigger: $trigger,
+              platforms: ["linux/amd64", "linux/arm64"],
+              registry: $registry,
+              image_size_mb: $image_size_mb
+            }' > metadata.json
 
-          # Create new release with the metadata file
-          gh release create "$RELEASE_TAG" \
-            --title "$RELEASE_NAME" \
-            --notes "$RELEASE_BODY" \
+          gh release delete "${release_tag}" --yes 2>/dev/null || true
+          gh release create "${release_tag}" \
+            --title "${release_name}" \
+            --notes-file release-notes.md \
             --latest \
             metadata.json
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate build summary
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IMAGE_CHANGED: ${{ steps.content-check.outputs.image-changed }}
+          PUSH_REASON: ${{ steps.content-check.outputs.push-reason }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          ALPINE_VERSION: ${{ steps.versions.outputs.alpine-version }}
+          OPENSSH_VERSION: ${{ steps.versions.outputs.openssh-version }}
+          RSYNC_VERSION: ${{ steps.versions.outputs.rsync-version }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "## 🐳 Container Image Built (PR)" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Image built successfully but not pushed (PR mode)" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
 
-          elif [ "${{ steps.content-check.outputs.image-changed }}" = "false" ]; then
-            echo "## ⚡ No Changes Detected" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Image content is identical to existing version - no push needed" >> $GITHUB_STEP_SUMMARY
-            echo "**Reason**: ${{ steps.content-check.outputs.push-reason }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "This saves registry storage and avoids unnecessary updates." >> $GITHUB_STEP_SUMMARY
+          {
+            if [ "${EVENT_NAME}" = "pull_request" ]; then
+              echo "## Container Image Built"
+              echo
+              echo "Image built successfully and was not pushed for the pull request."
+            elif [ "${IMAGE_CHANGED}" = "false" ]; then
+              echo "## No Changes Detected"
+              echo
+              echo "Image content is identical to the existing version, so no push was needed."
+              echo "**Reason**: ${PUSH_REASON}"
+            else
+              echo "## Container Image Built and Pushed"
+              echo
+              echo "**Reason**: ${PUSH_REASON}"
+              echo
+              echo "**Tags:**"
+              echo '```'
+              printf '%s\n' "${TAGS}"
+              echo '```'
+              echo
+              echo "### Package Versions"
+              echo '```'
+              echo "Alpine version: ${ALPINE_VERSION}"
+              echo "OpenSSH version: ${OPENSSH_VERSION}"
+              echo "Rsync version: ${RSYNC_VERSION}"
+              echo '```'
+              echo
+              echo "**Image:** \`${REGISTRY}/${IMAGE_NAME}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Delete scan candidate image
+        if: always() && github.event_name != 'pull_request' && steps.content-check.outputs.should-push == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: ${{ github.event.repository.name }}-staging
+          CANDIDATE_TAG: scan-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          owner_type="$(gh api "/users/${OWNER}" --jq '.type')"
+          if [ "${owner_type}" = "Organization" ]; then
+            package_scope="orgs/${OWNER}"
           else
-            echo "## 🐳 Container Image Built and Pushed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Reason**: ${{ steps.content-check.outputs.push-reason }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 📦 Package Versions" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "Alpine version: ${{ steps.versions.outputs.alpine-version }}" >> $GITHUB_STEP_SUMMARY
-            echo "OpenSSH version: ${{ steps.versions.outputs.openssh-version }}" >> $GITHUB_STEP_SUMMARY
-            echo "Rsync version: ${{ steps.versions.outputs.rsync-version }}" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+            package_scope="users/${OWNER}"
           fi
+
+          version_ids="$(
+            gh api "/${package_scope}/packages/container/${PACKAGE_NAME}/versions" \
+              --paginate \
+              --jq ".[] | select(.metadata.container.tags[]? == \"${CANDIDATE_TAG}\") | .id"
+          )"
+          version_id="$(printf '%s\n' "${version_ids}" | sed -n '1p')"
+
+          if [ -z "${version_id}" ]; then
+            echo "No scan candidate package version found for tag ${CANDIDATE_TAG}."
+            exit 0
+          fi
+
+          gh api \
+            --method DELETE \
+            -H "Accept: application/vnd.github+json" \
+            "/${package_scope}/packages/container/${PACKAGE_NAME}/versions/${version_id}"

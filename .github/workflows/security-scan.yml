@@ -1,14 +1,17 @@
 name: Security Scan
 
 on:
-  workflow_run:
-    workflows: ["Build and Push Container Image"]
-    types:
-      - completed
   workflow_dispatch:
   schedule:
-    # Run security scan daily at 8 AM UTC (2 hours after build)
+    # Re-scan the published image daily even if no new image was pushed.
     - cron: "0 8 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -16,15 +19,17 @@ env:
 
 jobs:
   vulnerability-scan:
-    runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    name: Scan published image
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-      security-events: write
+      packages: read # pull the published image from GHCR
+      security-events: write # upload Trivy SARIF to code scanning
+      issues: write # open/update the vulnerability tracking issue
 
     steps:
       - name: Log in to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -32,107 +37,140 @@ jobs:
 
       - name: Pull latest image
         run: |
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          set -euo pipefail
+          docker pull "${REGISTRY}/${IMAGE_NAME}:latest"
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          format: "sarif"
-          output: "trivy-results.sarif"
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-results.sarif
 
       - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         if: always()
         with:
-          sarif_file: "trivy-results.sarif"
+          sarif_file: trivy-results.sarif
 
       - name: Run Trivy vulnerability scanner (table output)
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          format: "table"
-          exit-code: 0
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
 
-      - name: Check for critical vulnerabilities
-        id: critical-check
-        run: |
-          # Run Trivy and check for CRITICAL vulnerabilities
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --exit-code 1 --severity CRITICAL \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest > /dev/null 2>&1
-
-          if [ $? -eq 0 ]; then
-            echo "No critical vulnerabilities found"
-            echo "critical-found=false" >> $GITHUB_OUTPUT
-          else
-            echo "Critical vulnerabilities detected!"
-            echo "critical-found=true" >> $GITHUB_OUTPUT
-          fi
+      - name: Check for high or critical vulnerabilities
+        id: vulnerability-check
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          scanners: vuln
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
 
       - name: Generate security summary
+        env:
+          VULNERABILITIES_FOUND: ${{ steps.vulnerability-check.outcome == 'failure' }}
         run: |
-          echo "## 🔒 Security Scan Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
 
-          if [ "${{ steps.critical-check.outputs.critical-found }}" = "true" ]; then
-            echo "⚠️ **Critical vulnerabilities detected!** Check the Security tab for details." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "✅ **No critical vulnerabilities found.**" >> $GITHUB_STEP_SUMMARY
-          fi
+          {
+            echo "## Security Scan Results"
+            echo
+            echo "**Image:** \`${REGISTRY}/${IMAGE_NAME}:latest\`"
+            echo
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Detailed vulnerability report is available in the Security tab." >> $GITHUB_STEP_SUMMARY
+            if [ "${VULNERABILITIES_FOUND}" = "true" ]; then
+              echo "**High or critical vulnerabilities detected.** Check the Security tab for details."
+            else
+              echo "**No high or critical vulnerabilities found.**"
+            fi
 
-      - name: Create issue for critical vulnerabilities
-        if: steps.critical-check.outputs.critical-found == 'true'
-        uses: actions/github-script@v7
+            echo
+            echo "Detailed vulnerability report is available in the Security tab."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update issue for high or critical vulnerabilities
+        if: steps.vulnerability-check.outcome == 'failure'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
         with:
           script: |
             const { owner, repo } = context.repo;
-            const title = '🚨 Critical Security Vulnerabilities Detected';
+            const image = process.env.IMAGE_REF;
+            const title = 'High or Critical Security Vulnerabilities Detected';
+            const runUrl = `${context.payload.repository.html_url}/actions/runs/${context.runId}`;
+            const labels = [
+              { name: 'security', color: 'd73a4a' },
+              { name: 'vulnerability', color: 'd73a4a' },
+              { name: 'high', color: 'fbca04' },
+              { name: 'critical', color: 'b60205' }
+            ];
+
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({ owner, repo, ...label });
+              } catch (error) {
+                if (error.status !== 422) throw error;
+              }
+            }
+
             const body = `
-            ## Critical Security Vulnerabilities Detected
+            ## High or Critical Security Vulnerabilities Detected
 
-            Our automated security scan has detected critical vulnerabilities in the latest container image.
+            The automated security scan detected high or critical vulnerabilities in the latest container image.
 
-            **Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`
+            **Image:** \`${image}\`
             **Scan Date:** ${new Date().toISOString().split('T')[0]}
+            **Workflow Run:** ${runUrl}
 
             ### Action Required
 
-            Please review the vulnerabilities in the [Security tab](${context.payload.repository.html_url}/security/code-scanning) and update dependencies as necessary.
-
-            ### Next Steps
-
-            1. Check the Security tab for detailed vulnerability information
-            2. Update base image and dependencies if possible
-            3. Consider using a specific Alpine version instead of \`latest\` for more control
-            4. Rebuild and redeploy the container image
+            Review the vulnerabilities in the [Security tab](${context.payload.repository.html_url}/security/code-scanning) and update the base image or packages as needed.
 
             This issue was automatically created by the security scan workflow.
             `;
 
-            // Check if an issue already exists
             const issues = await github.rest.issues.listForRepo({
               owner,
               repo,
               state: 'open',
-              labels: 'security,vulnerability'
+              per_page: 100
             });
 
-            const existingIssue = issues.data.find(issue =>
-              issue.title.includes('Critical Security Vulnerabilities Detected')
-            );
-
-            if (!existingIssue) {
-              await github.rest.issues.create({
+            const existingIssue = issues.data.find(issue => issue.title === title);
+            if (existingIssue) {
+              await github.rest.issues.update({
                 owner,
                 repo,
-                title,
-                body,
-                labels: ['security', 'vulnerability', 'critical']
+                issue_number: existingIssue.number,
+                body
               });
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existingIssue.number,
+                body: `High or critical vulnerabilities are still present in \`${image}\`.\n\nWorkflow run: ${runUrl}`
+              });
+              return;
             }
+
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body,
+              labels: labels.map(label => label.name)
+            });
+
+      - name: Fail on high or critical vulnerabilities
+        if: steps.vulnerability-check.outcome == 'failure'
+        run: exit 1

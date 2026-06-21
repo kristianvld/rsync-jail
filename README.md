@@ -22,6 +22,7 @@
 - [📁 Volume Configuration](#-volume-configuration)
   - [Volume Options](#volume-options)
 - [🏗️ Building from Source](#️-building-from-source)
+- [🔐 Security and Updates](#-security-and-updates)
 - [🤝 Contributing](#-contributing)
 - [📝 License](#-license)
 - [🔗 Links](#-links)
@@ -39,6 +40,7 @@ This container allow arbitrary `rsync` commands to be executed by the user, mean
 - **SFTP** - Optionally enable SFTP
 - **Minimal** - Alpine based, only 19MB in size
 - **Disabled forwarding** - No TCP, agent, or X11 forwarding allowed
+- **Network filtering** - Allows inbound SSH only and blocks new outbound connections by default to reduce pivot risk
 - **Daily Updates** - Daily builds are automatically created to catch security updates and package updates
 - **Arm and AMD64** - Builds for both `linux/amd64` and `linux/arm64` architectures available
 
@@ -56,20 +58,20 @@ Users are defined in the `/users.json` file in the following format:
             "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIB..."
         ]
     },
-    "client2$": {
+    "client2": {
         "uid": 1001,
         "keys": [
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC..."
         ]
     },
-    "client.3": {
-        "uid": 1001,
+    "client3": {
+        "uid": 1002,
         "keys": [
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE...",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF..."
         ]
     },
-    "client-4": {
+    "client4": {
         "keys": [
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG..."
         ]
@@ -77,7 +79,7 @@ Users are defined in the `/users.json` file in the following format:
 }
 ```
 
-Here 4 users are defined using the usernames `client1`, `client2$`, `client.3` and `client-4`. Users may have an optional `uid` key to define the numerical UID of the users. Multiple users may use the same UID, and due to the use of chroot, users with the same uid will still not have access to each other's data directories. Users may even be given UID of `0` (`root`) if desired, which may be required for rsync to set correct permissions during transfer, but should not pose any security issue due to the chroot isolation. If no `uid` key is provided, the user id will be assigned a new unused UID.
+Here 4 users are defined using the usernames `client1`, `client2`, `client3` and `client4`. Usernames must match `^[a-z_][a-z0-9_-]{0,31}$`. Users may have an optional positive numeric `uid` key. UID `0` is intentionally rejected; users should not run as root inside the jail. If no `uid` key is provided, the user id will be assigned a new unused UID.
 
 Users may have multiple SSH public keys, which will be added to the user's authorized keys file. If no `keys` key is provided, the user will not be able to login.
 
@@ -97,7 +99,7 @@ Users may have multiple SSH public keys, which will be added to the user's autho
 > rsync -avz client1@fileserver:/data/my-files/ ./my-files/  # Absolute path within jail
 > ```
 
-**WARNING**: Be wary of special characters in the username that may upset commands such as `adduser`, `passwd` or `mkdir`. `/` especially will cause problems.
+If no `keys` key is provided, or if `keys` is an empty array, the user account is created but cannot authenticate.
 
 ```yaml
 services:
@@ -115,8 +117,13 @@ services:
       - ./client-data:/home/client/jail/data:ro  # example persistent read-only storage for the client user
       - ./pre-startup.sh:/pre-startup.sh:ro      # mount a pre-startup script for extra customization (optional)
     restart: unless-stopped
-    network_mode: none  # Disable outgoing network access to prevent network pivoting using the rsync command on the server
+    cap_add:
+      - NET_ADMIN  # Required for the default internal firewall; omit when filtering externally
 ```
+
+The container configures iptables at startup to allow inbound SSH, allow established connection replies, and block other inbound and outbound connections. This prevents SSH users from using `rsync` as a network pivot or starting a service reachable from the container network.
+
+The internal firewall requires `NET_ADMIN` inside the container. For stricter deployments, prefer Docker, host, or orchestrator-level network policy and omit that capability. When filtering is controlled externally, set `DISABLE_NETWORK_FIREWALL=1` and remove `NET_ADMIN`. If IPv6 is disabled or filtered outside the container and `ip6tables` is unavailable, set `ALLOW_IPV6_FIREWALL_FAILURE=1`.
 
 ### 2. Configure `~/.ssh/config` (optional)
 
@@ -141,26 +148,12 @@ rsync -avz fileserver: ./restored-files/
 
 ### 🔑 User Management
 
-Define users using environment variables with the pattern `USER_<username>=<ssh_public_key>`:
+Define users in `/users.json`. Each top-level key is the username, and each value may contain:
 
-```bash
-# Single key per user
-USER_alice=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
+- `keys`: an array of SSH public keys.
+- `uid`: an optional positive numeric UID.
 
-# Multiple keys per user (newline separated)
-USER_bob=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... bob@laptop\nssh-rsa AAAAB3NzaC1yc2EAAAA... bob@desktop
-```
-
-By default user ids are defined in order of appearance, meaning `alice` will have id `1000` and `bob` will have id `1001`. However, this can be overridden by setting the `UID_<username>=<id>` environment variable, e.g:
-
-```bash
-UID_alice=1003
-UID_bob=1003
-```
-
-This way, both alice and bob will have the uid `1003`.
-
-Due to the use of chroot, users with the same uid will still not have access to each other's data directories.
+Usernames are validated at startup and must match `^[a-z_][a-z0-9_-]{0,31}$`. UID `0` is rejected so SSH users do not run as root inside the jail.
 
 ### 💾 Volume Mapping
 
@@ -206,10 +199,12 @@ During startup, the script `/pre-startup.sh` is executed if it exists. The scrip
 
 ## 📝 Environment Variables
 
-| Variable          | Description                                                                                                       | Required | Example                                               |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------------------------------- |
-| `DEBUG`           | Enable debug logging and verbose output.                                                                          | No       | `DEBUG=1`                                             |
-| `SFTP`            | Enable SFTP subsystem in addition to `rsync`.                                                                     | No       | `SFTP=1`                                              |
+| Variable          | Description                                                                                                       | Required | Default | Example                                               |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------- | -------- | ------- | ----------------------------------------------------- |
+| `DEBUG`           | Enable debug logging and verbose output.                                                                          | No       | `disabled`   | `DEBUG=1`                                             |
+| `SFTP`            | Enable SFTP subsystem in addition to `rsync`.                                                                     | No       | `disabled`   | `SFTP=1`                                              |
+| `DISABLE_NETWORK_FIREWALL` | Disable the default iptables network firewall when filtering is handled externally.                     | No       | `disabled`   | `DISABLE_NETWORK_FIREWALL=1`                           |
+| `ALLOW_IPV6_FIREWALL_FAILURE` | Continue startup when IPv6 firewall setup fails. Use only when IPv6 is disabled or filtered externally. | No       | `disabled`   | `ALLOW_IPV6_FIREWALL_FAILURE=1`                       |
 
 ## 📁 Volume Configuration
 
@@ -234,6 +229,14 @@ git clone https://github.com/kristianvld/rsync-jail.git
 cd rsync-jail
 docker build -t rsync-jail .
 ```
+
+## 🔐 Security and Updates
+
+The Dockerfile pins Alpine by digest and the GitHub Actions workflows pin third-party actions by full commit SHA. Dependabot is enabled for Docker and GitHub Actions updates so those pins can move through reviewed pull requests.
+
+The container is built daily to pick up Alpine package updates from the pinned Alpine release branch. Runtime package upgrades are intentionally not performed inside running containers; deploy a rebuilt image instead.
+
+CI runs Trivy repository scans on pull requests, pushes, and schedule, and scans images before public tag promotion plus on a daily schedule. Image scans fail on high or critical vulnerabilities and upload SARIF results to the Security tab. Published images also get signed GitHub provenance and SPDX SBOM attestations after the scanned digest is promoted. GHCR requires the subject digest to exist in the public package before registry-backed attestation bundles can be pushed, so attestation failures fail CI after tag promotion and should be treated as a release-blocking incident.
 
 ## 🤝 Contributing
 

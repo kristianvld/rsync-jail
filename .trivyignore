@@ -1,0 +1,5 @@
+# sshd must start as root to authenticate users, create chroots, and drop privileges.
+DS-0002
+
+# This image intentionally exposes SSH; compose maps it to a host-selected port.
+DS-0004
